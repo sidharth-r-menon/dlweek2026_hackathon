@@ -493,15 +493,42 @@ async def transcribe_websocket(websocket: WebSocket, session_id: str):
     )
 
     REALTIME_INSTRUCTIONS = (
-        "You are a live transcription assistant for Singapore emergency calls. "
-        "Transcribe the caller's speech accurately, word for word. "
-        "The caller may speak English, Mandarin (Singapore accent), Malay, or Tamil, "
-        "and may code-switch between languages mid-sentence. "
-        "Do NOT generate any responses or commentary — only transcribe what is spoken. "
-        "Common Singapore locations: Tampines, Woodlands, Jurong, Bishan, Ang Mo Kio, "
-        "Clementi, Bedok, Toa Payoh, Yishun, Sengkang, Punggol, Chua Chu Kang, "
-        "Sembawang, Admiralty, Novena, Dhoby Ghaut, Bugis, Orchard, Marina Bay, "
-        "HDB block, void deck, MRT station, kopitiam, hawker centre, polyclinic."
+        "You are a live transcription assistant for Singapore emergency calls (Police/Ambulance/Fire). "
+        "Your ONLY task is to transcribe speech EXACTLY as spoken — word for word, with no paraphrasing, "
+        "summarising, or adding commentary. "
+        "CRITICAL: The caller may be panicking, crying, whispering, shouting, or hyperventilating. "
+        "Reproduce even fragmented, incomplete, or repeated speech faithfully. "
+        "MULTILINGUAL: The caller may speak Singapore English (Singlish), Mandarin (普通话/方言), "
+        "Malay (Bahasa Melayu), or Tamil (தமிழ்), and WILL likely code-switch mid-sentence. "
+        "Transcribe each language in its own script — do NOT transliterate Chinese to pinyin or Tamil to Roman. "
+        "For Singapore Mandarin: use Simplified Chinese characters. "
+        "For Singlish: preserve particles like 'lah', 'leh', 'meh', 'ah', 'lor', 'can', 'not'. "
+        "NEVER generate a response, never answer questions, never add punctuation beyond what is natural. "
+        "Output ONLY the transcription of what was spoken."
+    )
+
+    # Vocabulary prompt — biases the decoder toward Singapore-specific proper nouns.
+    # Include terms in all 4 languages so the model recognises them regardless of which is spoken.
+    TRANSCRIPTION_PROMPT = (
+        # English / Singlish emergency terms
+        "Singapore emergency call. "
+        "Ambulance, police, fire, accident, collapsed, unconscious, bleeding, chest pain, cannot breathe. "
+        "Locations: Tampines, Woodlands, Jurong East, Clementi, Bishan, Ang Mo Kio, Toa Payoh, "
+        "Hougang, Sengkang, Punggol, Pasir Ris, Bedok, Queenstown, Buona Vista, Novena, "
+        "Chua Chu Kang, Yishun, Sembawang, Admiralty, Dhoby Ghaut, Bugis, Orchard, "
+        "Marina Bay, Raffles Place, Tanjong Pagar. "
+        "Landmarks: HDB block, void deck, MRT station, bus interchange, kopitiam, hawker centre, "
+        "community club, polyclinic, carpark, lift lobby, playground, RC (resident committee). "
+        # Mandarin emergency terms (Simplified Chinese)
+        "救护车, 警察, 消防, 出事, 晕倒, 昏迷, 流血, 胸痛, 不能呼吸, "
+        "大巴窑, 义顺, 兀兰, 裕廊, 金文泰, 碧山, 宏茂桥, 淡滨尼, 勿洛, 后港, 盛港, 榜鹅, 蔡厝港, 三巴旺, "
+        "组屋, 地铁站, 巴士站, 咖啡店, 小贩中心, 停车场, 走廊. "
+        # Malay emergency terms
+        "Ambulans, polis, kebakaran, kemalangan, pengsan, tidak sedar, berdarah, sakit dada, "
+        "tidak boleh bernafas, tolong, cepat, kecemasan. "
+        # Tamil emergency terms
+        "ஆம்புலன்ஸ், போலீஸ், தீயணைப்பு, விபத்து, மயக்கம், நினைவிழந்தார், இரத்தம், "
+        "மார்பு வலி, மூச்சு விட முடியவில்லை, உதவி, விரைவாக."
     )
 
     try:
@@ -521,19 +548,18 @@ async def transcribe_websocket(websocket: WebSocket, session_id: str):
                     "input_audio_format": "pcm16",
                     "turn_detection": {
                         "type": "server_vad",
-                        "threshold": 0.5,
-                        "prefix_padding_ms": 300,
-                        "silence_duration_ms": 500,
+                        # Lower threshold (0.3) catches distressed/quiet/panicking callers.
+                        # 0.5 is too aggressive and misses speech from scared/whispering callers.
+                        "threshold": 0.3,
+                        "prefix_padding_ms": 500,   # capture word beginnings
+                        "silence_duration_ms": 800,  # longer pause before committing — callers pause mid-sentence
                         "create_response": False,
                     },
                     "input_audio_transcription": {
                         "model": "gpt-4o-transcribe",
-                        "prompt": (
-                            "Singapore emergency call. "
-                            "Locations: Tampines, Woodlands, Jurong, Bishan, Ang Mo Kio, "
-                            "Clementi, Bedok, Toa Payoh, Yishun, Sengkang, Punggol, "
-                            "Chua Chu Kang, HDB, void deck, MRT, kopitiam."
-                        ),
+                        # Do NOT set "language" here — let the model auto-detect.
+                        # Locking to a language kills multilingual/code-switching callers.
+                        "prompt": TRANSCRIPTION_PROMPT,
                     },
                 },
             }))
@@ -553,18 +579,14 @@ async def transcribe_websocket(websocket: WebSocket, session_id: str):
                             try:
                                 msg = json.loads(raw["text"])
                                 if msg.get("type") == "language_hint":
-                                    lang = msg.get("language", "en")
-                                    session["language_hint"] = lang
-                                    session_log(session_id, "LANGUAGE_HINT", lang)
-                                    await azure_ws.send(json.dumps({
-                                        "type": "session.update",
-                                        "session": {
-                                            "input_audio_transcription": {
-                                                "model": "gpt-4o-transcribe",
-                                                "language": lang,
-                                            }
-                                        },
-                                    }))
+                                    lang = msg.get("language", "")
+                                    # Store hint for callback generation only.
+                                    # Do NOT lock the transcription language — gpt-4o-transcribe
+                                    # auto-detects correctly and handles code-switching.
+                                    # Forcing language: 'en' would destroy Mandarin/Tamil/Malay transcription.
+                                    if lang:
+                                        session["language_hint"] = lang
+                                        session_log(session_id, "LANGUAGE_HINT", lang)
                             except Exception:
                                 pass
                 except (WebSocketDisconnect, Exception):
@@ -583,8 +605,12 @@ async def transcribe_websocket(websocket: WebSocket, session_id: str):
                                 session["transcript"] = (
                                     session.get("transcript", "") + " " + text
                                 ).strip()
+                                # Infer language from script if not yet detected
                                 if not session.get("language_detected"):
-                                    session["language_detected"] = session.get("language_hint", "en")
+                                    session["language_detected"] = (
+                                        _infer_language(text)
+                                        or session.get("language_hint", "en")
+                                    )
                                 session_log(session_id, "TRANSCRIPT", text)
                                 try:
                                     await websocket.send_json({
@@ -597,20 +623,35 @@ async def transcribe_websocket(websocket: WebSocket, session_id: str):
                                 except Exception:
                                     break
 
+                        elif etype == "input_audio_buffer.speech_started":
+                            logger.debug(f"[realtime] VAD: speech started")
+                            try:
+                                await websocket.send_json({"type": "speech_started"})
+                            except Exception:
+                                pass
+
+                        elif etype == "input_audio_buffer.speech_stopped":
+                            logger.debug(f"[realtime] VAD: speech stopped")
+                            try:
+                                await websocket.send_json({"type": "speech_stopped"})
+                            except Exception:
+                                pass
+
+                        elif etype == "input_audio_buffer.committed":
+                            logger.debug(f"[realtime] VAD: buffer committed")
+
                         elif etype == "error":
-                            logger.error(f"[realtime] Azure error: {event.get('error', {})}")
-                            session_log(session_id, "AZURE_ERROR", event.get("error", {}))
+                            err = event.get("error", {})
+                            logger.error(f"[realtime] Azure error: {err}")
+                            session_log(session_id, "AZURE_ERROR", err)
+                            try:
+                                await websocket.send_json({"type": "error", "message": err.get("message", "Azure error")})
+                            except Exception:
+                                pass
 
                         elif etype in ("session.created", "session.updated"):
                             logger.info(f"[realtime] {etype}")
                             session_log(session_id, etype.upper())
-
-                        elif etype in (
-                            "input_audio_buffer.speech_started",
-                            "input_audio_buffer.speech_stopped",
-                            "input_audio_buffer.committed",
-                        ):
-                            logger.debug(f"[realtime] VAD: {etype}")
 
                 except Exception as e:
                     logger.error(f"[realtime] receive_events error: {e}")
@@ -792,6 +833,32 @@ async def get_call(call_id: str):
 # ═══════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════
+
+
+def _infer_language(text: str) -> str:
+    """
+    Infer language from transcript text using Unicode block analysis.
+    Used to auto-detect language from first transcribed utterance without
+    locking the model to a fixed language up-front.
+    """
+    if not text:
+        return ""
+    # Tamil: U+0B80–U+0BFF
+    if any('\u0B80' <= c <= '\u0BFF' for c in text):
+        return 'ta'
+    # CJK Unified Ideographs (Mandarin/Chinese)
+    if any('\u4E00' <= c <= '\u9FFF' for c in text):
+        return 'zh'
+    # Malay uses Latin script — detect via common high-frequency Malay words
+    malay_markers = {
+        'saya', 'anda', 'dia', 'kami', 'kita', 'ada', 'tidak', 'tolong',
+        'sakit', 'darah', 'mati', 'jatuh', 'hospital', 'ambulans', 'polis',
+        'kebakaran', 'bantu', 'cepat', 'di', 'ke', 'dengan', 'dan', 'atau',
+    }
+    words = set(text.lower().split())
+    if len(words & malay_markers) >= 2:
+        return 'ms'
+    return 'en'
 
 def _sse_event(event_type: str, data: dict) -> str:
     """Format a Server-Sent Event string."""

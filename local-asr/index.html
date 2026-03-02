@@ -1,0 +1,300 @@
+<!doctype html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <title>Realtime Speech-to-Text</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 800px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+    }
+
+    button {
+      font-size: 1rem;
+      padding: 0.8rem 1.5rem;
+      cursor: pointer;
+    }
+
+    #status {
+      font-weight: 600;
+      margin-left: 10px;
+    }
+
+    /* Interim (in-progress speech turn) — shown in grey italics */
+    .interim {
+      color: #888;
+      font-style: italic;
+    }
+
+    /* Each completed turn on its own line */
+    .turn {
+      margin: 0.3rem 0;
+      padding: 0.2rem 0;
+      border-bottom: 1px solid #222;
+    }
+
+    #transcript {
+      white-space: pre-wrap;
+      background: #111;
+      color: #eee;
+      padding: 1rem;
+      border-radius: 8px;
+      min-height: 8rem;
+    }
+
+    #vadIndicator {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #444;
+      margin-left: 8px;
+      vertical-align: middle;
+      transition: background 0.1s;
+    }
+    #vadIndicator.speaking { background: #22cc66; }
+  </style>
+</head>
+
+<body>
+  <h2>Realtime Speech → Text (Azure gpt-4o-transcribe)</h2>
+  <p>
+    <button id="toggleBtn">🎙️ Start</button>
+    <span id="status">Disconnected</span>
+    <span id="vadIndicator" title="VAD: voice activity"></span>
+  </p>
+
+  <h3>Live Transcript</h3>
+  <div id="transcript"></div>
+
+  <script>
+    const WS_URL = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws/transcribe";
+
+    const btn          = document.getElementById("toggleBtn");
+    const statusEl     = document.getElementById("status");
+    const transcriptEl = document.getElementById("transcript");
+    const vadDot       = document.getElementById("vadIndicator");
+
+    let ws        = null;
+    let audioCtx  = null;
+    let processor = null;
+    let source    = null;
+    let stream    = null;
+    let recording = false;
+
+    // Track interim (in-progress) turns by item_id
+    // so we can replace them when .completed fires
+    const interimEls = {};
+
+    function logStatus(msg) {
+      console.log(msg);
+      statusEl.textContent = msg;
+    }
+
+    // ── Audio helpers ────────────────────────────────────────────────────────
+
+    function floatTo16PCM(float32Array) {
+      const buffer = new ArrayBuffer(float32Array.length * 2);
+      const view = new DataView(buffer);
+      let offset = 0;
+      for (let i = 0; i < float32Array.length; i++, offset += 2) {
+        let s = Math.max(-1, Math.min(1, float32Array[i]));
+        view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+      }
+      return buffer;
+    }
+
+    function downsampleBuffer(buffer, inputSampleRate, outSampleRate = 16000) {
+      if (outSampleRate === inputSampleRate) return buffer;
+      const ratio     = inputSampleRate / outSampleRate;
+      const newLength = Math.round(buffer.length / ratio);
+      const result    = new Float32Array(newLength);
+      let offsetResult = 0, offsetBuffer = 0;
+      while (offsetResult < result.length) {
+        const next = Math.round((offsetResult + 1) * ratio);
+        let accum = 0, count = 0;
+        for (let i = offsetBuffer; i < next && i < buffer.length; i++) { accum += buffer[i]; count++; }
+        result[offsetResult++] = accum / count;
+        offsetBuffer = next;
+      }
+      return result;
+    }
+
+    // ── WebSocket event handler ──────────────────────────────────────────────
+
+    function handleServerEvent(msg) {
+      console.log("← ", msg.type, msg);
+
+      switch (msg.type) {
+
+        // VAD: voice started — show a grey "listening" placeholder for this turn
+        case "input_audio_buffer.speech_started": {
+          vadDot.classList.add("speaking");
+          const itemId = msg.item_id;
+          if (!interimEls[itemId]) {
+            const el = document.createElement("div");
+            el.className = "turn interim";
+            el.dataset.itemId = itemId;
+            el.textContent = "…";
+            transcriptEl.appendChild(el);
+            interimEls[itemId] = el;
+          }
+          break;
+        }
+
+        // VAD: voice stopped — update placeholder text
+        case "input_audio_buffer.speech_stopped": {
+          vadDot.classList.remove("speaking");
+          const el = interimEls[msg.item_id];
+          if (el) el.textContent = "⏳ transcribing…";
+          break;
+        }
+
+        // ✅ KEY EVENT — full transcript for a completed speech turn
+        case "conversation.item.input_audio_transcription.completed": {
+          const itemId    = msg.item_id;
+          const transcript = (msg.transcript || "").trim();
+          const el = interimEls[itemId];
+
+          if (el) {
+            // Replace the placeholder with the real transcript
+            if (transcript) {
+              el.classList.remove("interim");
+              el.textContent = transcript;
+            } else {
+              // Empty transcript (silence) — remove the placeholder
+              el.remove();
+            }
+            delete interimEls[itemId];
+          } else if (transcript) {
+            // No placeholder existed — just append
+            const newEl = document.createElement("div");
+            newEl.className = "turn";
+            newEl.textContent = transcript;
+            transcriptEl.appendChild(newEl);
+          }
+
+          // Auto-scroll to bottom
+          transcriptEl.scrollTop = transcriptEl.scrollHeight;
+          break;
+        }
+
+        // Optional: delta events if they arrive (future-proofing)
+        case "conversation.item.input_audio_transcription.delta": {
+          const itemId = msg.item_id;
+          if (!interimEls[itemId]) {
+            const el = document.createElement("div");
+            el.className = "turn interim";
+            el.dataset.itemId = itemId;
+            transcriptEl.appendChild(el);
+            interimEls[itemId] = el;
+          }
+          interimEls[itemId].textContent += (msg.delta || "");
+          transcriptEl.scrollTop = transcriptEl.scrollHeight;
+          break;
+        }
+
+        case "error":
+          console.error("Server error:", msg);
+          logStatus("Error: " + (msg.error?.message || JSON.stringify(msg)));
+          break;
+
+        // Session ready
+        case "transcription_session.created":
+        case "transcription_session.updated":
+          logStatus("Recording…");
+          break;
+
+        default:
+          break;
+      }
+    }
+
+    // ── WebSocket connect ────────────────────────────────────────────────────
+
+    function connectWS() {
+      return new Promise((resolve, reject) => {
+        const socket = new WebSocket(WS_URL);
+        socket.onopen  = () => resolve(socket);
+        socket.onerror = reject;
+        socket.onclose = () => {
+          logStatus("Disconnected");
+          vadDot.classList.remove("speaking");
+        };
+        socket.onmessage = (event) => {
+          try { handleServerEvent(JSON.parse(event.data)); }
+          catch (e) { console.warn("Unparseable message:", event.data); }
+        };
+      });
+    }
+
+    // ── Start / Stop ─────────────────────────────────────────────────────────
+
+    async function startRecording() {
+      if (recording) return;
+      recording = true;
+      btn.textContent = "⏹ Stop";
+      logStatus("Connecting…");
+      transcriptEl.innerHTML = "";   // clear previous session
+
+      try {
+        ws = await connectWS();
+      } catch (e) {
+        logStatus("Connection failed");
+        recording = false;
+        btn.textContent = "🎙️ Start";
+        return;
+      }
+
+      logStatus("Starting…");
+
+      audioCtx  = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+      stream    = await navigator.mediaDevices.getUserMedia({ audio: true });
+      source    = audioCtx.createMediaStreamSource(stream);
+      processor = audioCtx.createScriptProcessor(4096, 1, 1);
+
+      processor.onaudioprocess = (e) => {
+        if (!recording || !ws || ws.readyState !== WebSocket.OPEN) return;
+        const input      = e.inputBuffer.getChannelData(0);
+        const downsampled = downsampleBuffer(input, audioCtx.sampleRate, 16000);
+        const pcm16      = floatTo16PCM(downsampled);
+        const b64        = btoa(String.fromCharCode(...new Uint8Array(pcm16)));
+        ws.send(JSON.stringify({ type: "audio", b64 }));
+      };
+
+      source.connect(processor);
+      processor.connect(audioCtx.destination);
+    }
+
+    async function stopRecording() {
+      if (!recording) return;
+      recording = false;
+      btn.textContent = "🎙️ Start";
+      logStatus("Stopping…");
+
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "commit" }));
+        ws.send(JSON.stringify({ type: "stop" }));
+        setTimeout(() => ws && ws.close(), 1500);
+      }
+
+      if (processor) processor.disconnect();
+      if (source)    source.disconnect();
+      if (stream)    stream.getTracks().forEach(t => t.stop());
+      if (audioCtx)  audioCtx.close();
+
+      processor = null; source = null; stream = null; audioCtx = null;
+      logStatus("Stopped");
+    }
+
+    btn.onclick = async () => {
+      if (!recording) await startRecording();
+      else            await stopRecording();
+    };
+  </script>
+</body>
+
+</html>

@@ -39,6 +39,7 @@ export default function LiveCallSession({ sessionId, callId, onEnd }) {
   const [isDispatched, setIsDispatched] = useState(false)
   const [isAnalyzing, setIsAnalyzing] = useState(false)
   const [linkCopied, setLinkCopied] = useState(false)
+  const [callerSpeaking, setCallerSpeaking] = useState(false)
 
   const signalWs = useRef(null)
   const transcribeWs = useRef(null)
@@ -139,11 +140,16 @@ export default function LiveCallSession({ sessionId, callId, onEnd }) {
       if (msg.type === 'transcript_update') {
         transcriptRef.current = msg.full_transcript
         setTranscript(msg.full_transcript)
-        if (msg.language && !language) setLanguage(msg.language)
+        // Update language from server's auto-detection (overrides UI hint)
+        if (msg.language) setLanguage(msg.language)
+      } else if (msg.type === 'speech_started') {
+        setCallerSpeaking(true)
+      } else if (msg.type === 'speech_stopped') {
+        setCallerSpeaking(false)
       }
     }
     ws.onerror = (e) => console.error('[transcribe ws] error', e)
-  }, [sessionId, language])
+  }, [sessionId])
 
   // ── Open analysis WS ─────────────────────────────────────
   const openAnalysisWs = useCallback(() => {
@@ -461,9 +467,14 @@ export default function LiveCallSession({ sessionId, callId, onEnd }) {
               <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-300">Live Transcript</h2>
             </div>
             <div className="flex items-center gap-2">
-              {callerConnected && <span className="w-2 h-2 bg-green-400 rounded-full animate-pulse" />}
-              <span className={`text-xs ${callerConnected ? 'text-green-400' : 'text-yellow-400'}`}>
-                {callerConnected ? 'Caller on line' : 'Waiting…'}
+              {callerConnected && (
+                <span className={`w-2 h-2 rounded-full ${callerSpeaking ? 'bg-red-400 animate-ping' : 'bg-green-400 animate-pulse'}`} />
+              )}
+              <span className={`text-xs ${
+                callerSpeaking ? 'text-red-400 font-semibold' :
+                callerConnected ? 'text-green-400' : 'text-yellow-400'
+              }`}>
+                {callerSpeaking ? '● Speaking…' : callerConnected ? 'Caller on line' : 'Waiting…'}
               </span>
             </div>
           </div>
