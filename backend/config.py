@@ -15,11 +15,14 @@ class Settings:
     AZURE_OPENAI_API_VERSION: str = os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
     AZURE_OPENAI_DEPLOYMENT_NAME: str = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o")
 
-    # ── Azure OpenAI Transcription (gpt-4o-transcribe) ───────
+    # ── Azure OpenAI Realtime (gpt-realtime — live transcription + VAD) ────
+    # These are the same env vars as before; just renamed semantically.
     AZURE_WHISPER_API_KEY: str = os.getenv("AZURE_WHISPER_API_KEY", "")
     AZURE_WHISPER_ENDPOINT: str = os.getenv("AZURE_WHISPER_ENDPOINT", "")
-    AZURE_WHISPER_API_VERSION: str = os.getenv("AZURE_WHISPER_API_VERSION", "2025-01-01-preview")
-    AZURE_WHISPER_DEPLOYMENT_NAME: str = os.getenv("AZURE_WHISPER_DEPLOYMENT_NAME", "gpt-4o-transcribe")
+    AZURE_WHISPER_API_VERSION: str = os.getenv("AZURE_WHISPER_API_VERSION", "2025-04-01-preview")
+    AZURE_WHISPER_DEPLOYMENT_NAME: str = os.getenv("AZURE_WHISPER_DEPLOYMENT_NAME", "gpt-realtime")
+    # Realtime API version (may differ from transcription REST API version)
+    AZURE_REALTIME_API_VERSION: str = os.getenv("AZURE_REALTIME_API_VERSION", "2025-04-01-preview")
 
     # ── External APIs ──────────────────────────────────────
     DATAGOVSG_API_URL: str = os.getenv("DATAGOVSG_API_URL", "https://data.gov.sg/api/action/datastore_search")

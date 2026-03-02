@@ -9,14 +9,15 @@ Provides REST API endpoints for the dispatcher dashboard, including:
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
-import tempfile
 import uuid
 from datetime import datetime
 from typing import Dict, Any, Optional
 
+import websockets as ws_client
 from fastapi import FastAPI, HTTPException, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -27,7 +28,6 @@ from models import ProcessCallRequest, DispatcherAction, CallState
 from agents.graph import run_pipeline
 from demo.scenarios import list_scenarios, get_scenario
 from services.callback_generator import callback_generator
-from services.whisper_service import whisper_service
 
 # ── Logging ─────────────────────────────────────────────────
 logging.basicConfig(
@@ -462,10 +462,13 @@ async def signal_websocket(websocket: WebSocket, session_id: str, role: str):
 @app.websocket("/ws/transcribe/{session_id}")
 async def transcribe_websocket(websocket: WebSocket, session_id: str):
     """
-    Receives raw audio chunks (webm/opus) from the dispatcher's browser
-    (captured from the caller's WebRTC remote track), transcribes each chunk
-    via gpt-4o-transcribe, and streams transcript updates back.
-    Also forwards transcript updates to the dispatcher's signaling WS.
+    Proxies raw PCM16 audio (24 kHz, mono) from the dispatcher's browser
+    to the Azure gpt-realtime WebSocket.
+
+    Azure's native server-VAD detects speech boundaries; the
+    conversation.item.input_audio_transcription.completed event carries
+    the per-utterance transcript, which is forwarded to the frontend.
+    No batch Whisper calls, no Silero VAD, no temp files.
     """
     await websocket.accept()
     if session_id not in live_sessions:
@@ -473,104 +476,169 @@ async def transcribe_websocket(websocket: WebSocket, session_id: str):
         return
 
     session = live_sessions[session_id]
-    logger.info(f"[transcribe] WS opened for session {session_id}")
-    session_log(session_id, "TRANSCRIBE_WS_OPEN")
+    logger.info(f"[realtime] WS opened for session {session_id}")
+    session_log(session_id, "REALTIME_WS_OPEN")
+
+    # Build the Azure Realtime WebSocket URL
+    endpoint = (
+        settings.AZURE_WHISPER_ENDPOINT
+        .replace("https://", "")
+        .replace("http://", "")
+        .rstrip("/")
+    )
+    azure_url = (
+        f"wss://{endpoint}/openai/realtime"
+        f"?deployment={settings.AZURE_WHISPER_DEPLOYMENT_NAME}"
+        f"&api-version={settings.AZURE_REALTIME_API_VERSION}"
+    )
+
+    REALTIME_INSTRUCTIONS = (
+        "You are a live transcription assistant for Singapore emergency calls. "
+        "Transcribe the caller's speech accurately, word for word. "
+        "The caller may speak English, Mandarin (Singapore accent), Malay, or Tamil, "
+        "and may code-switch between languages mid-sentence. "
+        "Do NOT generate any responses or commentary — only transcribe what is spoken. "
+        "Common Singapore locations: Tampines, Woodlands, Jurong, Bishan, Ang Mo Kio, "
+        "Clementi, Bedok, Toa Payoh, Yishun, Sengkang, Punggol, Chua Chu Kang, "
+        "Sembawang, Admiralty, Novena, Dhoby Ghaut, Bugis, Orchard, Marina Bay, "
+        "HDB block, void deck, MRT station, kopitiam, hawker centre, polyclinic."
+    )
 
     try:
-        chunk_index = 0
-        while True:
-            raw = await websocket.receive()
+        async with ws_client.connect(
+            azure_url,
+            additional_headers={"api-key": settings.AZURE_WHISPER_API_KEY},
+            max_size=None,
+        ) as azure_ws:
+            logger.info(f"[realtime] Connected to Azure for session {session_id}")
 
-            if "bytes" in raw:
-                audio_bytes = raw["bytes"]
-            elif "text" in raw:
-                # Control message (e.g. language hint)
+            # Configure session: server VAD + transcription, no response generation
+            await azure_ws.send(json.dumps({
+                "type": "session.update",
+                "session": {
+                    "modalities": ["text"],
+                    "instructions": REALTIME_INSTRUCTIONS,
+                    "input_audio_format": "pcm16",
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": 0.5,
+                        "prefix_padding_ms": 300,
+                        "silence_duration_ms": 500,
+                        "create_response": False,
+                    },
+                    "input_audio_transcription": {
+                        "model": "gpt-4o-transcribe",
+                        "prompt": (
+                            "Singapore emergency call. "
+                            "Locations: Tampines, Woodlands, Jurong, Bishan, Ang Mo Kio, "
+                            "Clementi, Bedok, Toa Payoh, Yishun, Sengkang, Punggol, "
+                            "Chua Chu Kang, HDB, void deck, MRT, kopitiam."
+                        ),
+                    },
+                },
+            }))
+
+            # Task 1: browser → Azure (PCM16 audio forwarding)
+            async def forward_audio() -> None:
                 try:
-                    msg = json.loads(raw["text"])
-                    if msg.get("type") == "language_hint":
-                        session["language_hint"] = msg.get("language", "")
-                        session_log(session_id, "LANGUAGE_HINT", msg.get("language", ""))
-                except Exception:
+                    while True:
+                        raw = await websocket.receive()
+                        if "bytes" in raw:
+                            audio_b64 = base64.b64encode(raw["bytes"]).decode()
+                            await azure_ws.send(json.dumps({
+                                "type": "input_audio_buffer.append",
+                                "audio": audio_b64,
+                            }))
+                        elif "text" in raw:
+                            try:
+                                msg = json.loads(raw["text"])
+                                if msg.get("type") == "language_hint":
+                                    lang = msg.get("language", "en")
+                                    session["language_hint"] = lang
+                                    session_log(session_id, "LANGUAGE_HINT", lang)
+                                    await azure_ws.send(json.dumps({
+                                        "type": "session.update",
+                                        "session": {
+                                            "input_audio_transcription": {
+                                                "model": "gpt-4o-transcribe",
+                                                "language": lang,
+                                            }
+                                        },
+                                    }))
+                            except Exception:
+                                pass
+                except (WebSocketDisconnect, Exception):
                     pass
-                continue
-            else:
-                continue
 
-            chunk_index += 1
-            chunk_label = f"chunk_{chunk_index:04d}"
-
-            # Skip chunks that are too small — likely empty/corrupt (< 1.5KB)
-            if not audio_bytes or len(audio_bytes) < 1500:
-                logger.debug(f"[transcribe] skipping tiny chunk ({len(audio_bytes)} bytes)")
-                session_log(session_id, f"{chunk_label} SKIPPED (too small)", f"{len(audio_bytes)} bytes")
-                continue
-
-            # Write to a temp file for the transcription API
-            # Detect format from magic bytes: WAV starts with RIFF, WebM with \x1a\x45
-            suffix = ".wav" if audio_bytes[:4] == b'RIFF' else ".webm"
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
-                f.write(audio_bytes)
-                tmp_path = f.name
-
-            try:
-                lang_hint = session.get("language_hint") or "en"
-                transcript_so_far = session.get("transcript", "")
-                session_log(session_id, f"{chunk_label} SENDING TO WHISPER", f"{len(audio_bytes)} bytes | lang_hint={lang_hint}")
-                text, lang, conf = await asyncio.to_thread(
-                    whisper_service.transcribe, tmp_path, lang_hint
-                )
-                session_log(session_id, f"{chunk_label} WHISPER RESULT", f"text={repr(text)} | lang={lang} | conf={conf:.2f}")
-
-                # ── Deduplication ─────────────────────────────────────────────
-                # Two cases to catch:
-                # 1. Full-transcript echo: result is suspiciously long (> ~120 chars
-                #    for a 3s chunk at ~150wpm) and already exists in the transcript.
-                # 2. Tail overlap: result exactly matches the last N chars of the
-                #    transcript (chunk was silent, Whisper re-generated last words).
-                if text.strip() and transcript_so_far:
-                    t = text.strip()
-                    tail = transcript_so_far[-max(len(t) + 20, 80):].strip()
-                    tail_lower = tail.lower()
-                    t_lower = t.lower()
-                    # Skip if the result appears at the very end of the transcript
-                    # (tail-match: new text IS what was already transcribed last)
-                    is_tail_echo = tail_lower.endswith(t_lower) or t_lower in tail_lower[-len(t_lower) - 10:]
-                    # Skip if result is very long AND already fully contained
-                    # (full-transcript echo during silence)
-                    is_full_echo = len(t) > 80 and t_lower in transcript_so_far.lower()
-                    if is_tail_echo or is_full_echo:
-                        session_log(session_id, f"{chunk_label} DEDUP_SKIP",
-                                    f"tail_echo={is_tail_echo} full_echo={is_full_echo} | '{t[:60]}...'")
-                        text = ""
-
-                if text.strip():
-                    session["transcript"] = (session.get("transcript", "") + " " + text).strip()
-                    if lang and not session.get("language_detected"):
-                        session["language_detected"] = lang
-
-                    payload = {
-                        "type": "transcript_update",
-                        "text": text.strip(),
-                        "full_transcript": session["transcript"],
-                        "language": lang,
-                        "confidence": round(conf, 2),
-                    }
-                    session_log(session_id, f"{chunk_label} TRANSCRIPT_UPDATE", f"text={repr(text.strip())} | full_len={len(session['transcript'])}")
-                    await websocket.send_json(payload)
-
-            except Exception as e:
-                logger.error(f"[transcribe] chunk error: {e}")
-                session_log(session_id, f"{chunk_label} ERROR", str(e))
-                await websocket.send_json({"type": "error", "message": str(e)})
-            finally:
+            # Task 2: Azure → browser (transcript events)
+            async def receive_events() -> None:
                 try:
-                    os.unlink(tmp_path)
+                    async for message in azure_ws:
+                        event = json.loads(message)
+                        etype = event.get("type", "")
+
+                        if etype == "conversation.item.input_audio_transcription.completed":
+                            text = event.get("transcript", "").strip()
+                            if text:
+                                session["transcript"] = (
+                                    session.get("transcript", "") + " " + text
+                                ).strip()
+                                if not session.get("language_detected"):
+                                    session["language_detected"] = session.get("language_hint", "en")
+                                session_log(session_id, "TRANSCRIPT", text)
+                                try:
+                                    await websocket.send_json({
+                                        "type": "transcript_update",
+                                        "text": text,
+                                        "full_transcript": session["transcript"],
+                                        "language": session.get("language_detected", "en"),
+                                        "confidence": 1.0,
+                                    })
+                                except Exception:
+                                    break
+
+                        elif etype == "error":
+                            logger.error(f"[realtime] Azure error: {event.get('error', {})}")
+                            session_log(session_id, "AZURE_ERROR", event.get("error", {}))
+
+                        elif etype in ("session.created", "session.updated"):
+                            logger.info(f"[realtime] {etype}")
+                            session_log(session_id, etype.upper())
+
+                        elif etype in (
+                            "input_audio_buffer.speech_started",
+                            "input_audio_buffer.speech_stopped",
+                            "input_audio_buffer.committed",
+                        ):
+                            logger.debug(f"[realtime] VAD: {etype}")
+
+                except Exception as e:
+                    logger.error(f"[realtime] receive_events error: {e}")
+
+            # Run both tasks; cancel the other when either finishes
+            tasks = [
+                asyncio.create_task(forward_audio()),
+                asyncio.create_task(receive_events()),
+            ]
+            _done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for t in pending:
+                t.cancel()
+                try:
+                    await t
                 except Exception:
                     pass
 
     except WebSocketDisconnect:
-        logger.info(f"[transcribe] WS closed for session {session_id}")
-        session_log(session_id, "TRANSCRIBE_WS_CLOSED", f"final_transcript={repr(session.get('transcript', ''))[:200]}")
+        logger.info(f"[realtime] Frontend WS disconnected for session {session_id}")
+    except Exception as e:
+        logger.error(f"[realtime] Connection error for session {session_id}: {e}")
+        session_log(session_id, "REALTIME_CONNECT_ERROR", str(e))
+    finally:
+        session_log(
+            session_id, "REALTIME_WS_CLOSED",
+            f"final_transcript={repr(session.get('transcript', ''))[:200]}"
+        )
+
 
 
 @app.websocket("/ws/analyze/{session_id}")

@@ -22,9 +22,6 @@ import CallbackPanel from './CallbackPanel'
 const WS_BASE = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}`
 const API_BASE = '/api'
 const ICE_SERVERS = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }
-const CHUNK_INTERVAL_MS = 3000  // 3-second non-overlapping chunks
-                                 // Cross-chunk context is provided by sending the
-                                 // rolling transcript tail as the Whisper prompt (server-side)
 
 export default function LiveCallSession({ sessionId, callId, onEnd }) {
   const [phase, setPhase] = useState('waiting')  // waiting|calling|connected|ended
@@ -67,16 +64,10 @@ export default function LiveCallSession({ sessionId, callId, onEnd }) {
   // ── Cleanup ──────────────────────────────────────────────
   const cleanup = useCallback(() => {
     clearInterval(timerRef.current)
-    if (transcribeWs.current?._recordInterval) {
-      clearInterval(transcribeWs.current._recordInterval)
-    }
+    // Stop PCM16 audio capture (AudioContext + ScriptProcessor)
+    try { transcribeWs.current?._processor?.disconnect() } catch (_) {}
+    try { transcribeWs.current?._audioCtx?.close() } catch (_) {}
     if (mediaRecorder.current?.state === 'recording') mediaRecorder.current.stop()
-    // Disconnect Web Audio nodes and close AudioContext (if any were created)
-    try {
-      transcribeWs.current?._processor?.disconnect()
-      transcribeWs.current?._source?.disconnect()
-      transcribeWs.current?._audioCtx?.close()
-    } catch (_) {}
     localStream.current?.getTracks().forEach(t => t.stop())
     pc.current?.close()
     signalWs.current?.close()
@@ -97,51 +88,50 @@ export default function LiveCallSession({ sessionId, callId, onEnd }) {
     })
   }, [callerLink])
 
-  // ── Start streaming audio chunks to transcription WS ────
+  // ── Start transcription via Azure gpt-realtime ───────────
+  // The browser captures the caller's WebRTC remote track as raw PCM16
+  // at 24 kHz and streams it to the backend WebSocket, which proxies it
+  // to the Azure Realtime API. Azure's native server-VAD handles speech
+  // detection; transcripts arrive via conversation.item.input_audio_transcription.completed.
+  // No Silero VAD, no ONNX, no batch Whisper chunks needed.
   const startTranscription = useCallback((remoteStream) => {
     const wsUrl = `${WS_BASE}/ws/transcribe/${sessionId}`
     const ws = new WebSocket(wsUrl)
     transcribeWs.current = ws
 
     ws.onopen = () => {
-      // Always send a language hint — without it gpt-4o-transcribe hallucinates
-      // in random languages (Korean, Arabic etc.) on background noise.
       ws.send(JSON.stringify({ type: 'language_hint', language: language || 'en' }))
+      console.log('[transcribe] WS open — starting PCM16 audio capture @24 kHz')
 
-      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-        ? 'audio/webm;codecs=opus'
-        : 'audio/webm'
+      try {
+        // Resample the WebRTC stream to 24 kHz (required by the Realtime API)
+        const ctx = new AudioContext({ sampleRate: 24000 })
+        const source = ctx.createMediaStreamSource(remoteStream)
 
-      // ── Non-overlapping stop/start recording ───────────────────────────
-      // Each chunk is a complete standalone WebM file (no fragments).
-      // Cross-chunk context is provided on the server side by passing the
-      // rolling transcript tail as the Whisper prompt= parameter — this is
-      // Whisper's intended streaming design and costs zero extra audio bandwidth.
-      let intervalId = null
+        // 4096 samples ≈ 170 ms per chunk at 24 kHz — good latency vs overhead
+        // eslint-disable-next-line no-undef
+        const processor = ctx.createScriptProcessor(4096, 1, 1)
+        source.connect(processor)
+        processor.connect(ctx.destination)
 
-      const recordChunk = () => {
-        const recorder = new MediaRecorder(remoteStream, { mimeType })
-        const chunks = []
-
-        recorder.ondataavailable = (e) => {
-          if (e.data.size > 0) chunks.push(e.data)
-        }
-
-        recorder.onstop = () => {
-          if (chunks.length > 0 && ws.readyState === WebSocket.OPEN) {
-            const blob = new Blob(chunks, { type: mimeType })
-            if (blob.size > 1000) ws.send(blob)  // skip silent/empty chunks
+        processor.onaudioprocess = (e) => {
+          if (ws.readyState !== WebSocket.OPEN) return
+          const float32 = e.inputBuffer.getChannelData(0)
+          // Convert Float32 [-1, 1] → Int16 PCM16
+          const pcm16 = new Int16Array(float32.length)
+          for (let i = 0; i < float32.length; i++) {
+            const s = Math.max(-1, Math.min(1, float32[i]))
+            pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF
           }
+          ws.send(pcm16.buffer)
         }
 
-        recorder.start()
-        mediaRecorder.current = recorder
-        setTimeout(() => { if (recorder.state === 'recording') recorder.stop() }, CHUNK_INTERVAL_MS)
+        // Store refs for cleanup
+        transcribeWs.current._audioCtx = ctx
+        transcribeWs.current._processor = processor
+      } catch (err) {
+        console.error('[transcribe] AudioContext setup failed:', err)
       }
-
-      recordChunk()
-      intervalId = setInterval(recordChunk, CHUNK_INTERVAL_MS + 100)
-      transcribeWs.current._recordInterval = intervalId
     }
 
     ws.onmessage = (event) => {
@@ -152,7 +142,6 @@ export default function LiveCallSession({ sessionId, callId, onEnd }) {
         if (msg.language && !language) setLanguage(msg.language)
       }
     }
-
     ws.onerror = (e) => console.error('[transcribe ws] error', e)
   }, [sessionId, language])
 
