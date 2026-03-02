@@ -1,0 +1,48 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  margin: 0;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #1e293b;
+}
+::-webkit-scrollbar-thumb {
+  background: #475569;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #64748b;
+}
+
+/* Blinking recording indicator */
+@keyframes blink-recording {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+.blink-recording {
+  animation: blink-recording 1.2s ease-in-out infinite;
+}
+
+/* Word-by-word transcript animation */
+.transcript-word {
+  opacity: 0;
+  animation: fadeInWord 0.3s ease forwards;
+}
+@keyframes fadeInWord {
+  to { opacity: 1; }
+}
+
+/* Confidence bar */
+.confidence-bar {
+  transition: width 0.8s ease-out;
+}
